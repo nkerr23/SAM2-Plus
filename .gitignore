@@ -19,3 +19,10 @@ demo/backend/checkpoints/*.pt
 
 checkpoints/sam2.1/*
 checkpoints/SAM2-Plus/*
+
+demo/data/
+my_data/
+my_data_box/
+my_data_kal/
+my_data_seg/
+output/
