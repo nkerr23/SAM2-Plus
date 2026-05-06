@@ -20,20 +20,24 @@ from tools.sot_inference import save_boxes_to_dir, save_masks_and_boxes_to_dir
 from training.dataset_plus.box.utils import np_box_xywh_to_xyxy, np_box_xyxy_to_xywh, np_masks_to_boxes, np_box_clamp_xywh
 from benchmarks.sot_benchmark.datasets.utils import load_text
 
-from run_files.img_input import dicom_to_jpg, numpy_to_npz, load_coords, motion_video, print_statistics, ema_filter_rt, compare_2graphs, print_multi_stats, multi_np_to_npz, Kalman2D, numpy_to_txt
+from run_files.img_input import dicom_to_jpg, numpy_to_npz, numpy_to_jpg, load_coords, motion_video, print_statistics, ema_filter_rt, compare_2graphs, print_multi_stats, multi_np_to_npz, Kalman2D, numpy_to_txt
 
 #---- INPUT ----------------------------------------------------------------------------
 
-input_data = '../data/realtime/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0152'
+input_data = '../data/realtime_npy/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0152'
 manual_boundbox = '../data/bounding_boxes/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0152/liver'
 output_root = "./my_data_box" 
 start = 23
 
-#---------------------------------------------------------------------------------------
+#---- Hoffman Cluster GPU COMMAND: qrsh -l gpu,A6000,cuda=1 -------------------------------
 
 dpath = Path(input_data)
 output_full = output_root / Path(*dpath.parts[-2:])
 output_full.mkdir(parents=True, exist_ok=True)
+
+input_video_dir = numpy_to_jpg(input_data, output_root)
+input_box_path = numpy_to_txt(manual_boundbox, input_data, output_root)
+output_box_dir = output_full / "output"
 
 predictor = build_sam2_video_predictor_plus(
     config_file="configs/sam2.1/sam2.1_hiera_b+_predmasks_decoupled_MAME.yaml",
@@ -45,10 +49,6 @@ predictor = build_sam2_video_predictor_plus(
     vos_optimized=False,
     task='box'
 )
-
-input_video_dir = dicom_to_jpg(input_data, output_root, start)
-input_box_path = numpy_to_txt(manual_boundbox, input_data, output_root)
-output_box_dir = output_full / "output"
 
 score_thresh = 0
 

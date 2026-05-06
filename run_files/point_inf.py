@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -6,6 +7,10 @@ from tqdm import tqdm
 import numpy as np
 from natsort import natsorted
 from datetime import datetime
+from pathlib import Path
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, PROJECT_ROOT)
 
 from sam2_plus.build_sam import build_sam2_video_predictor_plus
 
@@ -13,11 +18,27 @@ from tools.visualization import show_mask, show_box, show_points
 from tools.vos_inference import load_ann_png, get_per_obj_mask, DAVIS_PALETTE, save_masks_to_dir
 from tools.pt_inference_plus import load_visible_points_from_npz
 
-from run_files.img_input import dicom_to_jpg, numpy_to_npz, load_coords, motion_video, print_statistics, ema_filter_rt, compare_2graphs, print_multi_stats, multi_np_to_npz, Kalman2D
+from run_files.img_input import dicom_to_jpg, numpy_to_jpg, numpy_to_npz, load_coords, motion_video, print_statistics, ema_filter_rt, compare_2graphs, print_multi_stats, multi_np_to_npz, Kalman2D
+
+#---- INPUT ----------------------------------------------------------------------------
+
+input_data = '../data/realtime_npy/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0347'
+manual_points = '../data/manual_tracking_coords/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0347_needleTip'
+output_root = "./my_data_kal" 
+
+#---- Hoffman Cluster GPU COMMAND: qrsh -l gpu,A6000,cuda=1 -------------------------------
+
+dpath = Path(input_data)
+output_full = output_root / Path(*dpath.parts[-2:])
+output_full.mkdir(parents=True, exist_ok=True)
+
+input_video_dir = numpy_to_jpg(input_data, output_root)
+input_point_path, pt_folders = multi_np_to_npz(manual_points, input_data, output_root)
+output_point_dir = output_full / "output"
 
 predictor = build_sam2_video_predictor_plus(
     config_file="configs/sam2.1/sam2.1_hiera_b+_predmasks_decoupled_MAME.yaml",
-    ckpt_path="../checkpoints/SAM2-Plus/checkpoint_phase123.pt",
+    ckpt_path="./checkpoints/SAM2-Plus/checkpoint_phase123.pt",
     apply_postprocessing=False,
     hydra_overrides_extra=[
         "++model.non_overlap_masks=" + ("false")
@@ -25,21 +46,6 @@ predictor = build_sam2_video_predictor_plus(
     vos_optimized=False,
     task='point'
 )
-
-#----------  GPU COMMAND:    qrsh -l gpu,A6000,cuda=1  ------------------
-
-#input_data = '/Users/nina/Documents/ucla/research/mrrl/data/In vivo pig experiments/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0154'
-#point_tracking = '/Users/nina/Documents/ucla/research/mrrl/data/manual_tracking_coords/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0154/needle_tip'
-#point_tracking = '/Users/nina/Documents/ucla/research/mrrl/data/manual_tracking_coords/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0154/liver_edge'
-
-input_data = '../../data/realtime/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0347'
-#point_tracking = '/Users/nina/Documents/ucla/research/mrrl/data/manual_tracking_coords/CV_GARADIAL_GRE1_OBL_SAG_3SL_DYNAMIC_0307/vessel'
-#point_tracking = '../../data/manual_tracking_coords/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0298/vesselB'
-point_tracking = '../../data/manual_tracking_coords/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0347_needleTip'
-
-input_video_dir = dicom_to_jpg(input_data, '../my_data_kal', 23)
-input_point_path, pt_folders = multi_np_to_npz(point_tracking, input_data, '../my_data_kal')
-output_point_dir = "../my_data_kal/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0347_needleTip/output" #/vesselB"
 
 radius, sigma = 5, 2
 score_thresh = 0
@@ -126,8 +132,6 @@ with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
     end_time = datetime.now()
     runtime = end_time-start_time
     print(runtime)
-
-    print(point_array.shape)
     
     # write the output masks as palette PNG files to output_mask_dir
     os.makedirs(output_point_dir, exist_ok=True)

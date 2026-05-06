@@ -115,6 +115,33 @@ def numpy_to_txt(points_np, dicom_path, output_root):
     print(f"Saved TXT to: {output_file}")
     return str(output_file)
 
+def numpy_to_jpg(input_path, output_root):
+    npath = Path(input_path)
+
+    # matches your DICOM naming convention
+    output_path = output_root / Path(*npath.parts[-2:]) / "images"
+
+    os.makedirs(output_path, exist_ok=True)
+
+    npy_files = natsorted(npath.glob("*.npy"))
+
+    for img_i, f in enumerate(npy_files):
+        img = np.load(f)
+
+        # normalize if needed
+        if img.dtype != np.uint8:
+            img = img.astype(np.float32)
+            img = 255 * (img - img.min()) / (img.max() - img.min() + 1e-8)
+            img = img.astype(np.uint8)
+
+        # grayscale -> 3 channel like your DICOM version
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        filename = output_path / f"{img_i:05d}.jpg"
+        cv2.imwrite(str(filename), img_rgb)
+
+    return str(output_path)
+
 def motion_video(input_folder, output_path, name = None):
     cur_time = datetime.now().strftime("%Y%m%d-%H%M%S")
     if not name:
