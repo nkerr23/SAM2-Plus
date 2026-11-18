@@ -43,7 +43,7 @@ HF_MODEL_ID_TO_FILENAMES = {
 def build_sam2_plus(
     config_file,
     ckpt_path=None,
-    device="cuda",
+    device="gpu",
     mode="eval",
     hydra_overrides_extra=[],
     apply_postprocessing=True,

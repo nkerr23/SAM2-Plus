@@ -14,10 +14,12 @@ import matplotlib.pyplot as plt
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
-from run_files.box_inf import build_predictor, track_boundingbox
+from run_files.box_inf import box_predictor, track_boundingbox
+from run_files.tracking_results import TrackingResult
+
 from training.dataset_plus.box.utils import np_box_xywh_to_xyxy, np_box_xyxy_to_xywh, np_masks_to_boxes, np_box_clamp_xywh
 from tools.visualization import show_mask, show_box, show_points
-from run_files.img_input import motion_video
+from run_files.img_input import motion_video, normalize
 
 #---- INPUT ------------------------------------------------------------------------------
 
@@ -32,10 +34,27 @@ output_root = "./my_data_box"
 #---- helper functions ------------------------------------------------------------------
 
 def initial_coords(coords_dir: str):
-    first_file = natsorted(Path(coords_dir).glob("*"))[0]
+    files = natsorted(Path(coords_dir).glob("*.npy"))
+    first_file = files[0]
     box = np.load(first_file)
-    print(box)
-    return box
+    box_xyxy = np.load(first_file).astype(np.float32).reshape(4)
+    x1, y1, x2, y2 = box_xyxy
+
+    box_xywh = np.array([
+        x1,
+        y1,
+        x2 - x1,
+        y2 - y1
+    ], dtype=np.float32)
+
+    print("xyxy:", box_xyxy)
+    print("xywh:", box_xywh)
+    #print(box)
+    #print(type(box))
+    #print(box.dtype)
+    #print(box.shape)
+    #print(box)
+    return box_xywh
 
 def load_manual_boxes(manual_dir: str) -> dict[int, np.ndarray]:
     files = natsorted(Path(manual_dir).glob("*.npy"))
@@ -195,17 +214,51 @@ def evaluate_and_plot(predicted: dict, manual: dict, output_dir: str):
     print(f"  Mean MSE:            {np.mean(mses):.4f}")
     print(f"  Mean center dist:    {np.mean(center_dists):.2f} px")
 
-def normalize(img):
-    if img.dtype != np.uint8:
-        img = img.astype(np.float32)
-        img = 255 * (img - img.min()) / (img.max() - img.min() + 1e-8)
-        img = img.astype(np.uint8)
+def get_first_frame_shape(input_dir: str):
+    files = natsorted(Path(input_dir).glob("*.npy"))
+    if not files:
+        raise FileNotFoundError(f"No .npy frames found in {input_dir}")
+    return np.load(files[0]).shape
 
-    # grayscale -> 3 channel BGR
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    return img_rgb
+def clamp_crop_roi(cropped_roi, frame_shape):
+    if cropped_roi is None:
+        return None
 
-def iter_frames(input_dir: str, poll_interval: float = 0.1, max_frames: int = None):
+    frame_h, frame_w = frame_shape[:2]
+    x, y, w, h = map(int, cropped_roi)
+    x1 = min(max(x + w, 0), frame_w)
+    y1 = min(max(y + h, 0), frame_h)
+    x0 = min(max(x, 0), frame_w)
+    y0 = min(max(y, 0), frame_h)
+
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError(
+            f"Crop ROI {cropped_roi} is outside frame bounds "
+            f"(width={frame_w}, height={frame_h})"
+        )
+
+    return [x0, y0, x1 - x0, y1 - y0]
+
+def crop_frame(frame, cropped_roi):
+    if cropped_roi is None:
+        return frame
+    x, y, w, h = clamp_crop_roi(cropped_roi, frame.shape)
+    return frame[y:y + h, x:x + w, ...]
+
+def load_all_frames(input_dir: str, cropped_roi=None):
+    files = natsorted(Path(input_dir).glob("*.npy"))
+
+    frames = []
+
+    for f in files:
+        frame = np.load(f)
+        frame = normalize(frame)
+        frame = crop_frame(frame, cropped_roi)
+        frames.append(frame)
+
+    return frames
+
+def iter_frames(input_dir: str, poll_interval: float = 0.1, max_frames: int = None, cropped_roi=None):
     seen = set()
     while True:
         available = natsorted(Path(input_dir).glob("*.npy"))
@@ -216,6 +269,7 @@ def iter_frames(input_dir: str, poll_interval: float = 0.1, max_frames: int = No
             time.sleep(poll_interval)
             frame = np.load(f)
             frame = normalize(frame)
+            frame = crop_frame(frame, cropped_roi)
             yield frame
             if max_frames and len(seen) >= max_frames:
                 return
@@ -223,51 +277,9 @@ def iter_frames(input_dir: str, poll_interval: float = 0.1, max_frames: int = No
         if not new:
             time.sleep(poll_interval)
 
-#---- main function: inputs = file folder of numpy arrays ----------------------------------
-
-if __name__ == "__main__":
-    #command line arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input_dir", type=str, help="path to folder of .npy frames")
-    parser.add_argument("init_box_dir", type=str, help="directory of npy file with initial box as x,y,w,h e.g. 316,385,742,488")
-    parser.add_argument("--num_frames", type=int, help="number of total frames")
-    parser.add_argument("--window", type=int, default=5, help="frames per batch (default 5)")
-    parser.add_argument("--score_thresh", type=float, default=0)
-    args = parser.parse_args()
-
-    initial_box = initial_coords(args.init_box_dir)
-    current_box = initial_box
-
-    predictor = build_predictor()
-
-    all_boxes = {}
-    frame_buffer = []
-    global_idx = 0
-
-    start_time = datetime.now()
-
-    for frame in iter_frames(input_dir=args.input_dir, max_frames=args.num_frames):
-        frame_buffer.append(frame)
-
-        if len(frame_buffer) < args.window:
-            continue
-    
-        boxes = track_boundingbox(frame_buffer, current_box, predictor, args.score_thresh)
-
-        all_boxes[global_idx] = boxes[0][1]
-        current_box = boxes[1][1]
-
-        global_idx += 1
-
-        # move forward by one image
-        frame_buffer.pop(0)
-
-    end_time = datetime.now()
-    runtime = end_time-start_time
-
-    # visualization & statistics
+def box_output(input_dir, init_box_dir, all_boxes):
     output_root = "./my_data_box" 
-    dpath = Path(args.input_dir)
+    dpath = Path(input_dir)
     output_full = output_root / Path(*dpath.parts[-2:])
     output_full.mkdir(parents=True, exist_ok=True)
 
@@ -279,8 +291,147 @@ if __name__ == "__main__":
 
     save_boxcoords(all_boxes, output_pts_dir)
 
-    manual_boxes = load_manual_boxes(args.init_box_dir)
+    manual_boxes = load_manual_boxes(init_box_dir)
     evaluate_and_plot(all_boxes, manual_boxes, output_dir=output_stats_dir)
 
-    save_vid(all_boxes, args.input_dir, output_img_dir)
+    save_vid(all_boxes, input_dir, output_img_dir)
     motion_video(output_img_dir, output_stats_dir, name = None)
+
+#---- main function: inputs = file folder of numpy arrays ----------------------------------
+
+#python run_files/box_predictor.py '../data/realtime_npy/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0152' '../data/bounding_boxes/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0152' --all_frames
+
+if __name__ == "__main__":
+    #command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_dir", type=str, help="path to folder of .npy frames")
+    parser.add_argument("init_box_dir", type=str, help="directory of npy file with initial box as x,y,w,h e.g. 316,385,742,488")
+    parser.add_argument("--all_frames", action="store_true")
+    parser.add_argument("--num_frames", type=int,help="number of total frames")
+    parser.add_argument("--window", type=int, default=8, help="frames per batch (default 5)")
+    parser.add_argument("--step", type=int, default=2, help="step size (default 3)")
+    parser.add_argument("--score_thresh", type=float, default=0)
+    parser.add_argument("--crop_roi", action=argparse.BooleanOptionalAction, default=True, help="crops ROI around initial bounding box to reduce computational time")
+    parser.add_argument("--max_size_change", type=float, default=0.1, help="maximum fractional width/height change from the initial box (default: 0.1)")
+    args = parser.parse_args()
+
+    if args.window <= 0 or args.step <= 0 or args.step > args.window:
+        parser.error("--window and --step must be positive, with --step <= --window")
+    if not 0 <= args.max_size_change < 1:
+        parser.error("--max_size_change must be in [0, 1)")
+
+    initial_box = initial_coords(args.init_box_dir)
+    current_box = initial_box
+    box_size_anchor = initial_box[-2:].copy()
+    box_predictor = box_predictor()
+    all_boxes = {}
+
+    cropped_roi = None
+    if args.crop_roi:
+        # crop images surrounding ROI [x_crop=x-x/2, y_crop=y-y/2, w+2x_crop, h+2y_crop]
+        x, y, w, h = initial_box
+        crop_margin = 0.30
+
+        side = max(w, h) * (1 + 2 * crop_margin)
+
+        center_x = x + w / 2
+        center_y = y + h / 2
+
+        x_crop = center_x - side / 2
+        y_crop = center_y - side / 2
+        w_crop = side
+        h_crop = side
+        x_crop, y_crop, w_crop, h_crop = map(int, (x_crop, y_crop, w_crop, h_crop))
+        cropped_roi = clamp_crop_roi(
+            [x_crop, y_crop, w_crop, h_crop],
+            get_first_frame_shape(args.input_dir),
+        )
+        x_crop, y_crop, w_crop, h_crop = cropped_roi
+        current_box = [x-x_crop, y-y_crop, w, h]
+
+    out_idx = 0
+    window_idx = 0
+    
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+    
+    if args.all_frames:
+        frames = load_all_frames(args.input_dir, cropped_roi=cropped_roi)
+        all_boxes = track_boundingbox(
+            frames, current_box, box_predictor, args.score_thresh,
+            box_size_anchor=box_size_anchor,
+            max_size_change=args.max_size_change,
+        )
+    else:
+        
+        frame_buffer = []
+        global_idx = 0
+
+        for frame in iter_frames(input_dir=args.input_dir, max_frames=args.num_frames, cropped_roi=cropped_roi):
+            frame_buffer.append(frame)
+
+            if len(frame_buffer) < args.window:
+                continue 
+
+            boxes = track_boundingbox(
+                frame_buffer, current_box, box_predictor, args.score_thresh,
+                box_size_anchor=box_size_anchor,
+                max_size_change=args.max_size_change,
+            )
+
+            if window_idx == 0:
+                # first window: save frames 0,1,2,3,4
+                for i in range(len(boxes)):
+                    all_boxes[out_idx] = boxes[i]#[1]
+                    out_idx += 1
+            else:
+                # later windows: skip frame 0 because it overlaps with previous window
+                for i in range(args.step, len(boxes)):
+                    all_boxes[out_idx] = boxes[i]#[1]
+                    out_idx += 1
+
+            print(type(all_boxes[0]))
+            print(all_boxes[0])
+
+            #all_boxes[global_idx] = boxes[0][1]
+            #current_box = boxes[1][1]
+            sorted_keys = sorted(boxes)
+            prompt_key = sorted_keys[-args.step]
+            current_box = boxes[prompt_key][1].copy()
+
+            window_idx += 1
+            global_idx += 1
+
+            # move forward by one image
+            #frame_buffer.pop(0)
+            frame_buffer = frame_buffer[-args.step:]
+
+    if args.crop_roi:
+        for frame_idx, frame_boxes in all_boxes.items():
+            for object_id, box_array in frame_boxes.items():
+                box_array[..., 0] += x_crop
+                box_array[..., 1] += y_crop
+
+    torch.cuda.synchronize()
+    runtime = time.perf_counter() - start_time
+    #runtime = end_time-start_time
+
+    # visualization & statistics
+    #box_output(args.input_dir, args.init_box_dir, all_boxes)
+
+    result = TrackingResult(
+        granularity='box', 
+        input_dir=args.input_dir,
+        output_root="./sam2_output_rt" ,
+        results=all_boxes,
+        runtime=runtime
+    )
+    
+    result.save_output()
+    result.load_reference(args.init_box_dir)
+    result.draw_box_overlay()
+    result.box_center()
+    result.motion_video(result.output_overlay, name = 'reference')
+    result.motion_video(result.output_compare, name = 'comparison')
+    result.print_stats(result.resu_center, result.ref_center, 'boxcenter_comparison')
+    result.graph_2traj(result.resu_center, result.ref_center, name = 'boxcenter_comparison_graph', labels=['SAM 2++ Tracking', 'Manual Tracking'])

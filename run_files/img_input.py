@@ -404,6 +404,29 @@ def print_multi_stats(prediction, path, num_points, runtime=None):
                 file.write(f"Runtime: {runtime} secs\n")
                 file.write(f"Runtime per frame: {avg_time} secs")
 
+def normalize(img):
+    #print(img.min())
+    #print(img.max())
+    '''
+    if img.dtype != np.uint8:
+        img = img.astype(np.float32)
+        img = 255 * (img - img.min()) / (img.max() - img.min() + 1e-8)
+        img = img.astype(np.uint8)
+
+    # grayscale -> 3 channel BGR
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    '''
+    img = np.asarray(img).astype(np.float32)
+
+    if img.ndim == 3:
+        img = img.squeeze()
+
+    img = 255 * (img - img.min()) / (img.max() - img.min() + 1e-8)
+    img = np.clip(img, 0, 255).astype(np.uint8)
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    return img_rgb
+
 class Kalman2D:
     def __init__(self, dt=1):
 
@@ -423,8 +446,8 @@ class Kalman2D:
         ])
 
         self.P = np.eye(4) * 500
-        self.R = np.eye(2) * 10
-        self.Q = np.eye(4) * 0.1
+        self.R = np.eye(2) * 2
+        self.Q = np.eye(4) * 1
 
     def predict(self):
 

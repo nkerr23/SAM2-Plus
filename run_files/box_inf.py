@@ -24,13 +24,13 @@ from benchmarks.sot_benchmark.datasets.utils import load_text
 from run_files.img_input import dicom_to_jpg, numpy_to_npz, numpy_to_jpg, load_coords, motion_video, print_statistics, ema_filter_rt, compare_2graphs, print_multi_stats, multi_np_to_npz, Kalman2D, numpy_to_txt
 
 #---- INPUT ----------------------------------------------------------------------------
-
+'''
 input_data = '../data/realtime_npy/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0152'
 manual_boundbox = '../data/bounding_boxes/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0152/liver'
 output_root = "./my_data_box" 
-
+'''
 #---- Hoffman Cluster GPU COMMAND: qrsh -l gpu,A6000,cuda=1 -------------------------------
-
+'''
 dpath = Path(input_data)
 output_full = output_root / Path(*dpath.parts[-2:])
 output_full.mkdir(parents=True, exist_ok=True)
@@ -38,20 +38,37 @@ output_full.mkdir(parents=True, exist_ok=True)
 input_video_dir = numpy_to_jpg(input_data, output_root) #replaced by tmp dir
 input_box_path = numpy_to_txt(manual_boundbox, input_data, output_root)
 output_box_dir = output_full / "output" # set input data to array input frames
-
+'''
 #---- build SAM2++ predictor -----------------------------------------------------------------
 
-def build_predictor() -> object:
+def box_predictor() -> object:
     return build_sam2_video_predictor_plus(
         config_file="configs/sam2.1/sam2.1_hiera_b+_predmasks_decoupled_MAME.yaml",
         ckpt_path="./checkpoints/SAM2-Plus/checkpoint_phase123.pt",
         apply_postprocessing=False,
         hydra_overrides_extra=[
-            "++model.non_overlap_masks=" + ("false")
+            "++model.non_overlap_masks=false",
+            "++model.image_size=896",
+            "++model.memory_attention.layer.self_attention.feat_sizes=[56,56]",
+            "++model.memory_attention.layer.cross_attention.feat_sizes=[56,56]",
         ],
         vos_optimized=False,
         task='box'
     )
+
+
+def clamp_box_xywh_to_frame(box_xywh, frame_shape):
+    box = np.asarray(box_xywh, dtype=np.float32)
+    original_shape = box.shape
+    x, y, w, h = box.reshape(4)
+    frame_h, frame_w = frame_shape[:2]
+    x0 = np.clip(x, 0, frame_w)
+    y0 = np.clip(y, 0, frame_h)
+    x1 = np.clip(x + w, 0, frame_w)
+    y1 = np.clip(y + h, 0, frame_h)
+    return np.array(
+        [x0, y0, max(0, x1 - x0), max(0, y1 - y0)], dtype=np.float32
+    ).reshape(original_shape)
 
 #---- main tracking function ------------------------------------------------------------------
 
@@ -60,10 +77,19 @@ def track_boundingbox(
     input_box_xywh, #(x, y, w, h)
     predictor,
     score_thresh: float = 0,
+    box_size_anchor=None,
+    max_size_change: float = 0.1,
 ) -> dict[int, np.ndarray]:
 
     # input box for first frame
     input_box_xywh = np.asarray(input_box_xywh, dtype=np.float64)
+    if box_size_anchor is None:
+        box_size_anchor = input_box_xywh[-2:]
+    box_size_anchor = np.asarray(box_size_anchor, dtype=np.float64).reshape(2)
+    if np.any(box_size_anchor <= 0):
+        raise ValueError(f"Box size anchor must be positive, got {box_size_anchor}")
+    if not 0 <= max_size_change < 1:
+        raise ValueError("max_size_change must be in [0, 1)")
 
     # write input frames to temporary directory for sam2++ to read from
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -74,18 +100,6 @@ def track_boundingbox(
         # run model 
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             inference_state = predictor.init_state(video_path=tmp_dir)
-
-            '''
-            video_name = os.path.basename(tmp_dir)
-            frame_names = [
-                os.path.splitext(p)[0]
-                for p in os.listdir(tmp_dir)
-                if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG"]
-            ]
-            frame_names = natsorted(frame_names)
-            height = inference_state["video_height"]
-            width = inference_state["video_width"]
-            '''
 
             input_frame_idx = 0     # the frame index we interact with
             object_id = 1           # give a unique id to each object we interact with (it can be any integers)
@@ -101,16 +115,57 @@ def track_boundingbox(
 
             # run propagation throughout the video and collect the results in a dict
             video_boxes_xywh = {}  # video_boxes_xyxy contains the per-frame bounding box results
+
+            kf_centers = {}
+            filtered_sizes = {}
+
             for out_frame_idx, out_obj_ids, _, output_box_xyxy, _ in predictor.propagate_in_video(
                 inference_state=inference_state,
             ):
                 if torch.any(output_box_xyxy[:,:,0] >= output_box_xyxy[:,:,2]) or torch.any(output_box_xyxy[:,:,1] >= output_box_xyxy[:,:,3]):
                     logging.warning(f"Invalid box prediction: {output_box_xyxy}")
             
+                '''
                 per_obj_output_box_xywh = {
                     out_obj_id: np_box_clamp_xywh(np_box_xyxy_to_xywh(output_box_xyxy[i].cpu().numpy()))
                     for i, out_obj_id in enumerate(out_obj_ids)
                 }
+                '''
+
+                per_obj_output_box_xywh = {}
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    raw_xywh = np_box_clamp_xywh(np_box_xyxy_to_xywh(output_box_xyxy[i].cpu().numpy()))
+                    x, y, w, h = raw_xywh.squeeze()
+
+                    if out_obj_id not in kf_centers:
+                        kf_centers[out_obj_id] = Kalman2D()
+                        filtered_sizes[out_obj_id] = box_size_anchor.copy()
+
+                    # filter center position
+                    cx_filt, cy_filt = kf_centers[out_obj_id].update((x + w / 2, y + h / 2))
+
+                    # Size has no meaningful velocity. Smooth it and keep it near the
+                    # original prompt so model errors cannot compound across windows.
+                    min_size = box_size_anchor * (1 - max_size_change)
+                    max_size = box_size_anchor * (1 + max_size_change)
+                    measured_size = np.clip((w, h), min_size, max_size)
+                    filtered_sizes[out_obj_id] = (
+                        0.8 * filtered_sizes[out_obj_id] + 0.2 * measured_size
+                    )
+                    w_filt, h_filt = filtered_sizes[out_obj_id]
+
+                    # reconstruct xywh from filtered center and size
+                    filtered_xywh = np.array([
+                        cx_filt - w_filt / 2,
+                        cy_filt - h_filt / 2,
+                        w_filt,
+                        h_filt,
+                    ], dtype=np.float32).reshape(raw_xywh.shape)
+
+                    per_obj_output_box_xywh[out_obj_id] = clamp_box_xywh_to_frame(
+                        filtered_xywh, input_frames[out_frame_idx].shape
+                    )
+
                 video_boxes_xywh[out_frame_idx] = per_obj_output_box_xywh
 
     return video_boxes_xywh

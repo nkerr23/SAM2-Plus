@@ -4,6 +4,7 @@ import torch
 import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm import tqdm
+import tempfile
 import numpy as np
 from natsort import natsorted
 from datetime import datetime
@@ -21,13 +22,13 @@ from tools.pt_inference_plus import load_visible_points_from_npz
 from run_files.img_input import dicom_to_jpg, numpy_to_jpg, numpy_to_npz, load_coords, motion_video, print_statistics, ema_filter_rt, compare_2graphs, print_multi_stats, multi_np_to_npz, Kalman2D
 
 #---- INPUT ----------------------------------------------------------------------------
-
+'''
 input_data = '../data/realtime_npy/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0347'
 manual_points = '../data/manual_tracking_coords/0119_RTimages/CV_GARADIAL_GRE3_OBL_SAG_3SL_DYNAMIC_0347_needleTip'
 output_root = "./my_data_kal" 
-
+'''
 #---- Hoffman Cluster GPU COMMAND: qrsh -l gpu,A6000,cuda=1 -------------------------------
-
+'''
 dpath = Path(input_data)
 output_full = output_root / Path(*dpath.parts[-2:])
 output_full.mkdir(parents=True, exist_ok=True)
@@ -35,100 +36,202 @@ output_full.mkdir(parents=True, exist_ok=True)
 input_video_dir = numpy_to_jpg(input_data, output_root)
 input_point_path, pt_folders = multi_np_to_npz(manual_points, input_data, output_root)
 output_point_dir = output_full / "output"
+'''
+#---- build SAM2++ predictor -----------------------------------------------------------------
 
-predictor = build_sam2_video_predictor_plus(
-    config_file="configs/sam2.1/sam2.1_hiera_b+_predmasks_decoupled_MAME.yaml",
-    ckpt_path="./checkpoints/SAM2-Plus/checkpoint_phase123.pt",
-    apply_postprocessing=False,
-    hydra_overrides_extra=[
-        "++model.non_overlap_masks=" + ("false")
-    ],
-    vos_optimized=False,
-    task='point'
-)
-
-radius, sigma = 5, 2
-score_thresh = 0
-
-start_time = datetime.now()
-
-with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-    video_name = os.path.basename(input_video_dir)
-    frame_names = [
-        os.path.splitext(p)[0]
-        for p in os.listdir(input_video_dir)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG"]
-    ]
-    frame_names = natsorted(frame_names)
-
-    inference_state = predictor.init_state(video_path=input_video_dir)
-    height = inference_state["video_height"]
-    width = inference_state["video_width"]
-
-    input_frame_idx = 0     # the frame index we interact with
-    #object_id = 0           # give a unique id to each object we interact with (it can be any integers)
-    #num_frames, num_points = len(frame_names), 1
-
-    input_data = np.load(input_point_path, allow_pickle=True)
-    input_point, input_visible = torch.tensor(input_data['trajs_2d'].astype(np.float32)), torch.tensor(input_data['visibs'].astype(bool))
-    per_obj_input_point = load_visible_points_from_npz(
-        input_points=input_point,
-        input_visibles=input_visible,
-        frame_idx=input_frame_idx,
+def point_predictor() -> object:
+    return build_sam2_video_predictor_plus(
+        config_file="configs/sam2.1/sam2.1_hiera_b+_predmasks_decoupled_MAME.yaml",
+        ckpt_path="./checkpoints/SAM2-Plus/checkpoint_phase123.pt",
+        apply_postprocessing=False,
+        hydra_overrides_extra=[
+            "++model.non_overlap_masks=false",
+            #"++model.image_size=896",
+            #"++model.memory_attention.layer.self_attention.feat_sizes=[56,56]",
+            #"++model.memory_attention.layer.cross_attention.feat_sizes=[56,56]",
+        ],
+        vos_optimized=False,
+        task='point'
     )
 
-    num_frames, num_points = input_point.shape[0], input_point.shape[1]
+#---- main tracking function  --------------------------------------------------------------
 
-    for object_id in range(num_points):
-        object_point = per_obj_input_point[object_id]
+def track_keypoint(
+        input_frames: list[np.ndarray],
+        input_points_xy, 
+        predictor,
+        score_thresh: float = 0,
+        kalman_filters: dict = None,
+        allframes_firstwindow: bool = True,
+    ) -> dict[int, np.ndarray]:
 
-        predictor.add_new_points_and_generate_gaussian_mask(
-            inference_state=inference_state,
-            frame_idx=input_frame_idx,
-            obj_id=object_id,
-            points=object_point.unsqueeze(0).numpy(),
-            labels=np.array([1]),
-            radius=radius,
-            sigma=sigma,
-        )
+    #radius, sigma = 5, 2
+    # Match the point model's standard 1024-pixel prompt footprint while
+    # preserving its relative size when inference uses another resolution.
+    prompt_scale = predictor.image_size / 1024
+    radius = max(1, round(50 * prompt_scale))
+    sigma = max(1, round(16 * prompt_scale))
+    score_thresh = 0
 
-    data = np.load(input_point_path, allow_pickle=True)
-    #print("trajs_2d:", data["trajs_2d"].shape)
-    #print("visibs:", data["visibs"].shape)
-    #print("frame 0 points:", data["trajs_2d"][:, 0, :])
-    #print("frame 0 visible:", data["visibs"][:, 0])
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for idx, frame in enumerate(input_frames):
+            img = Image.fromarray(frame)
+            img.save(os.path.join(tmp_dir, f"{idx:05d}.jpg"), quality=95)
 
-    # run propagation throughout the video and collect the results in a dict
-    point_array = -np.ones((num_frames, num_points, 2), dtype=np.float32)
-    point_array_unfilt = point_array.copy()
-    visible_array = np.zeros((num_frames, num_points), dtype=bool)
-
-    #filter_states = {i: None for i in range(num_points)}
-    kalman_filters = {i: Kalman2D() for i in range(num_points)}
-    alpha = 0.5
-
-    for out_frame_idx, out_obj_ids, out_mask_logits, out_box_xyxys, out_obj_score_logits in predictor.propagate_in_video(
-        inference_state
-    ):
-        for out_obj_id, out_mask_logit, out_obj_score_logit in zip(out_obj_ids, out_mask_logits, out_obj_score_logits):
-            out_mask_logit, out_obj_score_logit = out_mask_logit.squeeze(0), out_obj_score_logit.squeeze(0)
-            max_index = torch.argmax(out_mask_logit)
-            max_score_y, max_score_x = torch.unravel_index(max_index, out_mask_logit.shape)
-
-            point_array_unfilt[out_frame_idx, out_obj_id] = np.array([max_score_x.item(), max_score_y.item()], dtype=np.float32)
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+            inference_state = predictor.init_state(video_path=tmp_dir)
+            '''
+            video_name = os.path.basename(input_video_dir)
+            frame_names = [
+                os.path.splitext(p)[0]
+                for p in os.listdir(input_video_dir)
+                if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG"]
+            ]
+            frame_names = natsorted(frame_names)
+'''
+            height = inference_state["video_height"]
+            width = inference_state["video_width"]
             
-            #raw_point = (float(max_score_x.item()), float(max_score_y.item()))
-            ##filtered_point, filter_state = ema_filter_rt(raw_point, filter_state, alpha)
-            #filtered_point, filter_states[out_obj_id] = ema_filter_rt(raw_point,filter_states[out_obj_id],alpha)
+            '''
+            input_frame_idx = 0     # the frame index we interact with
+            #object_id = 0           # give a unique id to each object we interact with (it can be any integers)
+            #num_frames, num_points = len(frame_names), 1
 
-            raw_point = (float(max_score_x.item()), float(max_score_y.item()))
-            filtered_x, filtered_y = kalman_filters[out_obj_id].update(raw_point)
-            filtered_point = (filtered_x, filtered_y)
+            #add this to rt_predictor
+            #input_data = np.load(input_point_path, allow_pickle=True)
+            input_point, input_visible = torch.tensor(input_points_xy['trajs_2d'].astype(np.float32)), torch.tensor(input_points_xy['visibs'].astype(bool))
+            per_obj_input_point = load_visible_points_from_npz(
+                input_points=input_point,
+                input_visibles=input_visible,
+                frame_idx=input_frame_idx,
+            )
 
-            point_array[out_frame_idx, out_obj_id] = np.array(filtered_point, dtype=np.float32)
-            
-            visible_array[out_frame_idx, out_obj_id] = (out_obj_score_logit > score_thresh).cpu().numpy()
+            #num_frames, num_points = input_point.shape[0], input_point.shape[1]
+            num_frames = len(input_frames)
+            num_points = input_point.shape[1]
 
+            for object_id in range(num_points):
+                object_point = per_obj_input_point[object_id]
+
+                predictor.add_new_points_and_generate_gaussian_mask(
+                    inference_state=inference_state,
+                    frame_idx=input_frame_idx,
+                    obj_id=object_id,
+                    points=object_point.unsqueeze(0).numpy(),
+                    labels=np.array([1]),   
+                    radius=radius,
+                    sigma=sigma,
+                )
+            '''
+
+
+            input_point, input_visible = torch.tensor(input_points_xy['trajs_2d'].astype(np.float32)), torch.tensor(input_points_xy['visibs'].astype(bool))
+
+            num_context_frames = input_point.shape[0]  # 1 for first window, 4 for subsequent
+            num_frames = len(input_frames)
+            num_points = input_point.shape[1]
+
+            # add anchor points for each context frame
+            for ctx_frame_idx in range(num_context_frames):
+                per_obj_input_point = load_visible_points_from_npz(
+                    input_points=input_point,
+                    input_visibles=input_visible,
+                    frame_idx=ctx_frame_idx,
+                )
+
+                for object_id in range(num_points):
+                    object_point = per_obj_input_point[object_id]
+                    if object_point is None:
+                        continue
+
+                    if True:
+                        # full Gaussian mask for first/seed frame only
+                        predictor.add_new_points_and_generate_gaussian_mask(
+                            inference_state=inference_state,
+                            frame_idx=ctx_frame_idx,
+                            obj_id=object_id,
+                            points=object_point.unsqueeze(0).numpy(),
+                            labels=np.array([1]),
+                            radius=radius,
+                            sigma=sigma,
+                        )
+                    else:
+                        # lightweight point-only prompt for context frames
+                        predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=ctx_frame_idx,
+                            obj_id=object_id,
+                            points=object_point.unsqueeze(0).numpy(),
+                            labels=np.array([1]),
+                        )
+
+
+
+            #data = np.load(input_point_path, allow_pickle=True)
+            #print("trajs_2d:", data["trajs_2d"].shape)
+            #print("visibs:", data["visibs"].shape)
+            #print("frame 0 points:", data["trajs_2d"][:, 0, :])
+            #print("frame 0 visible:", data["visibs"][:, 0])
+
+            # run propagation throughout the video and collect the results in a dict
+            point_array = -np.ones((num_frames, num_points, 2), dtype=np.float32)
+            point_array_unfilt = point_array.copy()
+            visible_array = np.zeros((num_frames, num_points), dtype=bool)
+
+            #INITIALIZE KALMAN OUTSIDE LOOP
+            #filter_states = {i: None for i in range(num_points)}
+            #kalman_filters = {i: Kalman2D() for i in range(num_points)}
+            #alpha = 0.5
+
+            for out_frame_idx, out_obj_ids, out_mask_logits, out_box_xyxys, out_obj_score_logits in predictor.propagate_in_video(
+                inference_state
+            ):
+                for out_obj_id, out_mask_logit, out_obj_score_logit in zip(out_obj_ids, out_mask_logits, out_obj_score_logits):
+                    out_mask_logit, out_obj_score_logit = out_mask_logit.squeeze(0), out_obj_score_logit.squeeze(0)
+                    max_index = torch.argmax(out_mask_logit)
+                    max_score_y, max_score_x = torch.unravel_index(max_index, out_mask_logit.shape)
+                    '''
+                    #weighted centroid
+                    probs = torch.sigmoid(out_mask_logit)
+                    mask = probs > 0.3
+                    if mask.any():
+                        ys, xs = torch.where(mask)
+                        w = probs[mask]
+                        max_score_x = (xs.float() * w).sum() / w.sum()
+                        max_score_y = (ys.float() * w).sum() / w.sum()
+                    else:
+                        max_index = torch.argmax(out_mask_logit)
+                        max_score_y, max_score_x = torch.unravel_index(max_index, out_mask_logit.shape)
+                    '''
+                    point_array_unfilt[out_frame_idx, out_obj_id] = np.array([max_score_x.item(), max_score_y.item()], dtype=np.float32)
+                    
+                    #raw_point = (float(max_score_x.item()), float(max_score_y.item()))
+                    ##filtered_point, filter_state = ema_filter_rt(raw_point, filter_state, alpha)
+                    #filtered_point, filter_states[out_obj_id] = ema_filter_rt(raw_point,filter_states[out_obj_id],alpha)
+
+                    raw_point = (float(max_score_x.item()), float(max_score_y.item()))
+                    #filtered_x, filtered_y = kalman_filters[out_obj_id].update(raw_point)
+                    #filtered_point = (filtered_x, filtered_y)
+                    
+                    #if allframes_firstwindow or out_frame_idx == len(input_frames) - 1:
+                    # Overlap frames have already updated these persistent filters in
+                    # the preceding window. Update every genuinely new frame once.
+                    is_new_frame = allframes_firstwindow or out_frame_idx >= num_context_frames
+                    if is_new_frame:
+                        #filtered_x, filtered_y = kalman_filters[out_obj_id].update(raw_point)
+                        #filtered_point = (filtered_x, filtered_y)
+                        #point_array[out_frame_idx, out_obj_id] = np.array(filtered_point, dtype=np.float32)
+                        point_array[out_frame_idx, out_obj_id] = np.array(
+                            raw_point,
+                            dtype=np.float32,
+                        )
+                    else:
+                        point_array[out_frame_idx, out_obj_id] = np.array(raw_point)
+
+                    visible_array[out_frame_idx, out_obj_id] = (out_obj_score_logit > score_thresh).cpu().numpy()
+
+    return point_array, visible_array, width, height
+    '''
     end_time = datetime.now()
     runtime = end_time-start_time
     print(runtime)
@@ -190,7 +293,6 @@ with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
         print(f"\nPoint {point_idx} ({folder})")
         print_statistics(gt, pred, single_output, folder, runtime)
 
-    '''
     #compare filtered vs. unfiltered
     x0 = point_array_unfilt[:, 0, 0]
     y0 = point_array_unfilt[:, 0, 1]
