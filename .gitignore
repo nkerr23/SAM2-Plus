@@ -26,3 +26,6 @@ my_data_box/
 my_data_kal/
 my_data_seg/
 output/
+sam2_output_rt/
+examples/
+sav_dataset/
